@@ -1,199 +1,151 @@
-module Player exposing (takeTurn)
+module Player exposing (..)
 
-import Html.Attributes exposing (dir)
+import Browser.Navigation exposing (forward)
 import List.Extra as ListX
-import Time exposing (Month(..))
-import Warrior exposing (Warrior)
+import Warrior exposing (Action(..), Warrior, position)
 import Warrior.Coordinate exposing (Coordinate)
-import Warrior.Direction as Direction
-import Warrior.History exposing (History, previousActions)
+import Warrior.Direction as Dir
+import Warrior.History exposing (History, previousActions, previousStates)
 import Warrior.Map exposing (Map, look)
-import Warrior.Map.Tile exposing (Tile, canMoveOnto, isExit)
+import Warrior.Map.Tile exposing (Tile(..), canMoveOnto)
 
 
-type alias Position =
-    { coordinate : Coordinate
-    , tile : Tile
-    }
+type ScoredDirection
+    = ScoredDirection Dir.Direction Int
 
 
-toPosition : ( Coordinate, Tile ) -> Position
-toPosition ( coordinate, tile ) =
-    { coordinate = coordinate
-    , tile = tile
-    }
-
-
-type alias Path =
-    { dir : Direction.Direction
-    , positions : List Position
-    }
-
-
-getPath : Warrior -> Map -> Direction.Direction -> Path
-getPath warrior map dir =
-    let
-        positions =
-            look dir warrior map
-                |> ListX.takeWhile (\( _, tile ) -> canMoveOnto tile)
-                |> List.map toPosition
-    in
-    { dir = dir
-    , positions = positions
-    }
-
-
-
--- actually a Path can have multiple weights like CurrentForward and Unexplored
-
-
-type WeightedPath
-    = CurrentForward Path
-    | PathToExit Path
-    | CurrentBackward Path
-    | Unexplored Path
-    | DeadEnd
-
-
-compareWeightedPath : WeightedPath -> WeightedPath -> Order
-compareWeightedPath a b =
-    let
-        weight : WeightedPath -> Int
-        weight weightedPath =
-            case weightedPath of
-                PathToExit _ ->
-                    9
-
-                CurrentForward _ ->
-                    8
-
-                Unexplored _ ->
-                    7
-
-                CurrentBackward _ ->
-                    6
-
-                DeadEnd ->
-                    0
-    in
-    compare (weight a) (weight b)
-
-
-weightPath : List Warrior.Action -> Path -> WeightedPath
-weightPath prevActions path =
-    let
-        isDeadEnd : Path -> Bool
-        isDeadEnd { positions } =
-            List.isEmpty positions
-
-        -- visitedCoordinates =
-        --     previousStates warrior history
-        --         |> List.map (\( w, _ ) -> w)
-        --         |> List.map position
-        isMoveAction : Warrior.Action -> Bool
-        isMoveAction action =
-            case action of
-                Warrior.Move _ ->
-                    True
-
-                _ ->
-                    False
-
-        isSameDirection : Direction.Direction -> Warrior.Action -> Bool
-        isSameDirection pathDir action =
-            case action of
-                Warrior.Move dir ->
-                    pathDir == dir
-
-                _ ->
-                    False
-
-        lastMove =
-            prevActions
-                |> ListX.find isMoveAction
-
-        isCurrentForward : Path -> Bool
-        isCurrentForward { dir } =
-            lastMove
-                |> Maybe.map (isSameDirection dir)
-                |> Maybe.withDefault False
-
-        isCurrentBackward : Path -> Bool
-        isCurrentBackward { dir } =
-            let
-                flippedDir =
-                    flipDirection dir
-            in
-            lastMove
-                |> Maybe.map (isSameDirection flippedDir)
-                |> Maybe.withDefault False
-
-        isPathToExit : Path -> Bool
-        isPathToExit { positions } =
-            positions
-                |> List.any (.tile >> isExit)
-    in
-    if isPathToExit path then
-        PathToExit path
-
-    else if isDeadEnd path then
-        DeadEnd
-
-    else if isCurrentForward path then
-        CurrentForward path
-
-    else if isCurrentBackward path then
-        CurrentBackward path
-
-    else
-        Unexplored path
-
-
-findPaths : Warrior -> Map -> History -> List WeightedPath
-findPaths warrior map history =
-    Direction.all
-        |> List.map (getPath warrior map)
-        |> List.map (weightPath (previousActions warrior history))
-
-
-flipDirection : Direction.Direction -> Direction.Direction
+flipDirection : Dir.Direction -> Dir.Direction
 flipDirection dir =
     case dir of
-        Direction.Down ->
-            Direction.Up
+        Dir.Down ->
+            Dir.Up
 
-        Direction.Up ->
-            Direction.Down
+        Dir.Up ->
+            Dir.Down
 
-        Direction.Left ->
-            Direction.Right
+        Dir.Left ->
+            Dir.Right
 
-        Direction.Right ->
-            Direction.Left
+        Dir.Right ->
+            Dir.Left
 
+
+rateTile : (Coordinate -> Bool) -> ( Coordinate, Tile ) -> Int
+rateTile visited ( coordinate, tile ) =
+    case tile of
+        Wall ->
+            0
+
+        Empty ->
+            if visited coordinate then
+                -1
+
+            else
+                2
+
+        SpawnPoint ->
+            -2
+
+        Exit ->
+            5
+
+        Warrior _ ->
+            -1
+
+        Item _ ->
+            2
+
+
+nonEmptyList : List a -> Maybe (List a)
+nonEmptyList list =
+    case list of
+        [] ->
+            Nothing
+
+        _ ->
+            Just list
+
+
+rateByLastDirection : Warrior -> History -> Dir.Direction -> Int
+rateByLastDirection warrior history direction =
+    let
+        mapDirection : Action -> Maybe Dir.Direction
+        mapDirection action =
+            case action of
+                Move dir ->
+                    Just dir
+
+                _ ->
+                    Nothing
+
+        lastDirection =
+            previousActions warrior history
+                |> ListX.findMap mapDirection
+
+        backRating =
+            Maybe.map flipDirection lastDirection
+                |> Maybe.map
+                    (\back ->
+                        if direction == back then
+                            -5
+
+                        else
+                            0
+                    )
+                |> Maybe.withDefault 0
+
+        forwardRating =
+            lastDirection
+                |> Maybe.map
+                    (\forward ->
+                        if direction == forward then
+                            3
+
+                        else
+                            0
+                    )
+                |> Maybe.withDefault 0
+    in
+    backRating + forwardRating
+
+
+scoredDirections : Warrior -> Map -> History -> List ScoredDirection
+scoredDirections warrior map history =
+    let
+        visited coordinate =
+            List.member coordinate <|
+                (previousStates warrior history
+                    |> List.map (\( war, _ ) -> position war)
+                )
+
+        initialDirectionRating = rateByLastDirection warrior history
+
+        rateDirectionPath : ( Dir.Direction, List ( Coordinate, Tile ) ) -> ScoredDirection
+        rateDirectionPath (dir, path) =
+            path
+                |> List.map (rateTile visited)
+                |> List.foldl (+) (initialDirectionRating dir)
+                |> ScoredDirection dir
+
+        directionPath dir =
+            look dir warrior map
+                |> ListX.takeWhile (\( _, tile ) -> canMoveOnto tile)
+                |> nonEmptyList
+                |> Maybe.map (\tiles -> ( dir, tiles ))
+    in
+    Dir.all
+        |> List.filterMap directionPath
+        |> List.map rateDirectionPath
+
+
+
+{-
+   TODO:
+-}
 
 takeTurn : Warrior -> Map -> History -> Warrior.Action
 takeTurn warrior map history =
-    let
-        toAction : WeightedPath -> Warrior.Action
-        toAction weightedPath =
-            case weightedPath of
-                PathToExit { dir } ->
-                    Warrior.Move dir
-
-                Unexplored { dir } ->
-                    Warrior.Move dir
-
-                CurrentForward { dir } ->
-                    Warrior.Move dir
-
-                CurrentBackward { dir } ->
-                    Warrior.Move dir
-
-                DeadEnd ->
-                    Warrior.Wait
-    in
-    findPaths warrior map history
-        |> ListX.maximumWith compareWeightedPath
-        |> Maybe.map toAction
+    scoredDirections warrior map history
+        |> ListX.maximumBy (\(ScoredDirection _ score) -> score)
+        |> Maybe.map (\(ScoredDirection dir _) -> Warrior.Move dir)
         |> Maybe.withDefault Warrior.Wait
